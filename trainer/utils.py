@@ -6,6 +6,8 @@ import ast
 import os
 import gc
 
+import torch
+
 
 class PreprocessorForLocalizationAndSegmentation:
     """Sample usage:
@@ -18,6 +20,8 @@ class PreprocessorForLocalizationAndSegmentation:
     
     @staticmethod
     def preprocess(dataset_name: str, split: str="train", preprocess_fn: str="refcocog_sft_seg"):
+        assert preprocess_fn is not None, "preprocess_fn cannot be None."
+        
         preprocess_fn_dict = {"refcocog_sft_seg": PreprocessorForLocalizationAndSegmentation._refcocog_sft_seg}
         try:
             return preprocess_fn_dict.get(preprocess_fn)(dataset_name=dataset_name, split=split)
@@ -45,7 +49,7 @@ class PreprocessorForLocalizationAndSegmentation:
 
     @staticmethod
     def _refcocog_sft_seg(dataset_name: str, split: str="train"):
-        dataset = datasets.load_dataset(dataset_name, split=f"{split}")
+        dataset = datasets.load_dataset(dataset_name, split=f"{split}[:20]")
 
         def process_example(x):
             
@@ -62,7 +66,12 @@ class PreprocessorForLocalizationAndSegmentation:
             
             image_path = x['file_name']
             image_path = "_".join(image_path.split('_')[:-1]) + ".jpg"
-            full_image_path = os.path.join('/data/vlm/playground/data/coco/train2014', image_path)
+
+            test_mode = True
+            if not test_mode:
+                full_image_path = os.path.join('/data/vlm/playground/data/coco/train2014', image_path)
+            elif test_mode:
+                full_image_path = "https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg"
             
             if len_annots > 2:
                 chosen_sent_id = random.randint(a=0, b=len_annots-1)
@@ -100,16 +109,15 @@ class PreprocessorForLocalizationAndSegmentation:
             del image_path, seg_annots
             gc.collect()
 
-            return {
-                "messages": [system_message, user_message, asst_message],
-                "img_new_path": full_image_path,
-                "img_width": image_width,
-                "img_height": image_height,
-                "task_target": normalized_seg_annots,
-                "chosen_annot": chosen_annot,
-                "pil_img": load_image(full_image_path)}
+            return {"messages": [system_message, user_message, asst_message],
+                    "img_new_path": full_image_path,
+                    "img_width": image_width,
+                    "img_height": image_height,
+                    "task_target": normalized_seg_annots,
+                    "chosen_annot": chosen_annot,
+                    "pil_img": load_image(full_image_path)}
         
-        dataset = dataset.map(process_example, num_proc=8, batched=False)
+        dataset = dataset.map(process_example, num_proc=2, batched=False)
         chosen_cols = ['messages', 'img_new_path', 'img_width', 'img_height', 'task_target', 'chosen_annot', 'pil_img']
         dataset = dataset.remove_columns([col for col in dataset.column_names if col not in chosen_cols])
         return dataset

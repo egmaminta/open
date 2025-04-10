@@ -2,27 +2,30 @@ from abc import ABC, abstractmethod
 from transformers import AutoModelForVision2Seq, AutoTokenizer, AutoProcessor
 import torch
 import os
-from loguru import logger
-from typing import Callable
+import loguru
+from typing import Dict, List
 import numpy as np
+from muon import Muon
+import torch.optim as optim
 import gc
-
+from datasets import Dataset
+from torch.utils.data import DataLoader
 
 class Trainer(ABC):
     def __init__(self,
                  policy_model: AutoModelForVision2Seq,
                  processor: AutoProcessor,
                  tokenizer: AutoTokenizer,
-                 optimizer: torch.optim.Optimizer,
-                 scheduler: torch.optim.lr_scheduler.LRScheduler,
-                 device: str):
+                 optimizer: List[optim.Optimizer],
+                 device: str,
+                 config: Dict):
         self.policy_model = policy_model
         self.processor = processor
         self.tokenizer = tokenizer
         self.optimizer = optimizer
-        self.scheduler = scheduler
         self.device = device
-        self.logger = logger
+        self.config = config
+        self.logger = loguru.logger
         
         if hasattr(self.processor, 'image_processor'):
             self.logger.info('Setting image processor size to 512x512...')
@@ -58,20 +61,68 @@ class Trainer(ABC):
         del tokens_for_loc_and_seg_tasks, float_numbers
         gc.collect()
 
+    @staticmethod
+    def prepare_optimizers(model, optim_config: Dict):
+        lm_head_params_lr = optim_config.get('lm_head_params_lr')                   ## 2.666e-5
+        embed_params_lr = optim_config.get('embed_params_lr')                       ## 2.444e-5
+        scalar_params_lr = optim_config.get('scalar_params_lr')                     ## 2.333e-5
+        hidden_matrix_params_lr = optim_config.get('hidden_matrix_params_lr')       ## 2.777e-5
+        adamw_betas = optim_config.get('adamw_betas')                               ## (0.85, 0.95)
+        muon_momentum = optim_config.get('muon_momentum')                           ## 0.95
+
+        hidden_matrix_params = [p for n, p in model.named_parameters() if p.ndim >=2 and 'embed' not in n and 'lm_head' not in n]
+        embed_params = [p for n, p in model.named_parameters() if 'embed' in n and 'bias' not in n]
+        scalar_params = [p for n, p in model.named_parameters() if p.ndim < 2]
+        lm_head_params = [model.lm_head.weight]
+        
+        adamw_params = [dict(params=lm_head_params, lr=lm_head_params_lr),
+                        dict(params=embed_params, lr=embed_params_lr),
+                        dict(params=scalar_params, lr=scalar_params_lr)]
+        
+        adamw_optimizer = optim.AdamW(adamw_params, betas=adamw_betas, eps=1e-10)
+
+        muon_optimizer = Muon(hidden_matrix_params, lr=hidden_matrix_params_lr, momentum=muon_momentum, rank=0, world_size=1)
+        
+        optimizers = [adamw_optimizer, muon_optimizer]
+
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group['initial_lr'] = group['lr']
+
+        return optimizers
+
+    def get_lr(self, step: int, num_iterations: int, optim_config: Dict):     ## stable then decay
+        x = step / num_iterations
+        assert 0 <= x < 1
+        if x < 1 - optim_config.get('cooldown_frac'):
+            return 1.0
+        else:
+            w = (1.0 - x) / optim_config.get('cooldown_frac')
+            return w * 1.0 + (1 - w) * 0.1
+
+
     @abstractmethod
-    def prepare_dataset(self, messages):
+    def prepare_dataset(self, messages) -> Dataset:
         ...
 
     @abstractmethod
-    def build_dataloader(self, dataset, batch_size: int):
+    def build_dataloader(self, dataset, batch_size: int) -> DataLoader:
         ...
 
     @abstractmethod
-    def collate_fn(self, batch):
+    def collate_fn(self, batch) -> Dict[str, torch.Tensor]:
         ...
 
     @abstractmethod
-    def train_step(self, batch):
+    def train_step(self, batch, step: int, num_iterations: int) -> float:
+        ...
+
+    @abstractmethod
+    def valid_step(self, batch) -> float:
+        ...
+
+    @abstractmethod
+    def train(self, train_dataset: Dataset, valid_dataset: Dataset, num_iterations: int):
         ...
 
     def save_checkpoint(self, step: int, save_dir: str):
