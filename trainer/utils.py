@@ -1,26 +1,20 @@
 import datasets
-from datasets import Dataset
 from datasets.exceptions import DatasetNotFoundError
-from typing import Callable
 from transformers.image_utils import load_image
 import random
 import ast
-
-from transformers import AutoProcessor
-import numpy as np
-
-processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-256M-Instruct")
-float_numbers = np.arange(0., 1 + 0.001, 0.001)
-tokens_for_loc_and_seg_tasks = [f"{num:.{len(str(0.001).split('.')[-1])}f}" for num in float_numbers]
-tokens_for_loc_and_seg_tasks += [', ']
-processor.tokenizer.add_tokens(tokens_for_loc_and_seg_tasks)
-
-
-
-max_tokens_loaded = 0
+import os
+import gc
 
 
 class PreprocessorForLocalizationAndSegmentation:
+    """Sample usage:
+    ```python
+    from utils import PreprocessorForLocalizationAndSegmentation
+    dataset = PreprocessorForLocalizationAndSegmentation.preprocess(dataset_name="jxu124/refcocog", split="train", preprocess_fn="refcocog_sft_seg")
+    ```
+    This will load the dataset and preprocess it using the specified function.
+    """
     
     @staticmethod
     def preprocess(dataset_name: str, split: str="train", preprocess_fn: str="refcocog_sft_seg"):
@@ -34,13 +28,17 @@ class PreprocessorForLocalizationAndSegmentation:
     def system_prompt(mapped_dataset_name: str = "refcocog_sft_seg"):
         match mapped_dataset_name:
             case "refcocog_sft_seg":
-                return (f"A conversation between a user and assistant whose expertise is in understanding images and performing precise segmentation and object localization. "
+                return (f"A conversation between a user and an AI assistant whose expertise is in understanding images and performing precise segmentation and object localization. "
                         f"The user will provide an image and ask a question about the objects present in it. "
-                        f"Your task is to identify the objects requested by the user and provide their precise boundaries as a list of polygon points in the format [x1, y1, x2, y2, ...]. "
+                        f"Your task is to localize and segment the objects requested by the user and provide their precise boundaries as a list of polygon points in the format [x1, y1, x2, y2, ...]. "
                         f"Each number in the list represents a coordinate, with x representing the horizontal position and y representing the vertical position. "
-                        f"If the user asks for multiple objects, provide the polygon points for each object as a separate list within a main list. "
                         f"Ensure that all x and y coordinates are normalized to the range of 0.0 to 1.0, representing the relative position within the image dimensions (0.0 being the minimum and 1.0 being the maximum for both x and y). "
-                        f"If no objects matching the user's query are found in the image, respond with an empty list: []. "
+                        f"The user input will look like this: "
+                        f"<id_1>*object_name*</id_1>, where <id_1> </id_1> are tags that sandwich the *object_name* (if only 1 object is requested) and the *object_name* is the referred object the user wants you to localize and segment. "
+                        f"Your output will look like this: "
+                        f"<id_1_seg_1>x1, y1, x2, y2, ...</id_1_seg_1>, where <id_1_seg_1> </id_1_seg_1> are tags that sandwich the coordinates of the polygon points. "
+                        f"If there are multiple segmentated regions (for 1 object), you will have to provide the coordinates of each region in the format: "
+                        f"<id_1_seg_1>x1, y1, x2, y2, ...</id_1_seg_1><id_1_seg_2>x1, y1, x2, y2, ...</id_1_seg_2><id_1_seg_3>x1, y1, x2, y2, ...</id_1_seg_3>. "
                         f"If the user's request is ambiguous or cannot be fulfilled, respond with a message indicating the issue, but prioritize providing the polygon points if possible.")
             case _:
                 raise ValueError('Not implemented yet.')
@@ -50,17 +48,21 @@ class PreprocessorForLocalizationAndSegmentation:
         dataset = datasets.load_dataset(dataset_name, split=f"{split}")
 
         def process_example(x):
-            global max_tokens_loaded
+            
             system_message = {
                 "role": "system",
                 "content": [
                     {"type": "text", "text": PreprocessorForLocalizationAndSegmentation.system_prompt("refcocog_sft_seg")}
                 ]
             }
-            user_message_content = [{"type": "image"}]     # change this to paths
+            user_message_content = [{"type": "image"}]
 
             annots = x['sentences']
             len_annots = len(x['sentences'])
+            
+            image_path = x['file_name']
+            image_path = "_".join(image_path.split('_')[:-1]) + ".jpg"
+            full_image_path = os.path.join('/data/vlm/playground/data/coco/train2014', image_path)
             
             if len_annots > 2:
                 chosen_sent_id = random.randint(a=0, b=len_annots-1)
@@ -94,17 +96,20 @@ class PreprocessorForLocalizationAndSegmentation:
                     {"type": "text", "text": normalized_seg_annots}
                 ]
             }
+            
+            del image_path, seg_annots
+            gc.collect()
 
-            messages = [system_message, user_message, asst_message]
-            full_prompt_with_answer = processor.apply_chat_template(messages, tokenize=False)
-            token_count = len(processor.tokenizer.encode(full_prompt_with_answer))
-            if token_count >= max_tokens_loaded:
-                max_tokens_loaded = token_count
-
-            return {"messages": [system_message, user_message, asst_message]}
-        dataset = dataset.map(process_example, num_proc=1, batched=False)
+            return {
+                "messages": [system_message, user_message, asst_message],
+                "img_new_path": full_image_path,
+                "img_width": image_width,
+                "img_height": image_height,
+                "task_target": normalized_seg_annots,
+                "chosen_annot": chosen_annot,
+                "pil_img": load_image(full_image_path)}
+        
+        dataset = dataset.map(process_example, num_proc=8, batched=False)
+        chosen_cols = ['messages', 'img_new_path', 'img_width', 'img_height', 'task_target', 'chosen_annot', 'pil_img']
+        dataset = dataset.remove_columns([col for col in dataset.column_names if col not in chosen_cols])
         return dataset
-
-if __name__ == '__main__':
-    print(PreprocessorForLocalizationAndSegmentation.preprocess(dataset_name="jxu124/refcocog", split="train", preprocess_fn="refcocog_sft_seg"))
-    print(f"max tokens encoded: {max_tokens_loaded}")
