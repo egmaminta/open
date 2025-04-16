@@ -37,7 +37,7 @@ class PreprocessorForLocalizationAndSegmentation:
 
     @staticmethod
     def _refcocog_sft_seg(dataset_name: str, split: str="train"):
-        if split == "train":
+        if "train" in split:
             dataset = datasets.load_dataset(dataset_name, split=f"{split}")
         elif split == "test" or split == "validation":
             dataset = datasets.load_dataset(dataset_name, split=f"{split}[:200]")
@@ -76,13 +76,14 @@ class PreprocessorForLocalizationAndSegmentation:
             }
 
             seg_annots = ast.literal_eval(x['raw_anns'])['segmentation']
+
             image_width = ast.literal_eval(x['raw_image_info'])['width']
             image_height = ast.literal_eval(x['raw_image_info'])['height']
 
             if len(seg_annots) > 1:
                 normalized_seg_annots = ""
                 for r, seg_annot in enumerate(seg_annots):
-                    normalized_seg_annot = [round(polypoint/image_width, 3) if polypoint % 2 != 0 else round(polypoint/image_height, 3) for polypoint in seg_annot]
+                    normalized_seg_annot = [round(seg_annot[i]/image_height, 3) if i % 2 != 0 else round(seg_annot[i]/image_width, 3) for i in range(len(seg_annot))]
                     for idx, seg_annot in enumerate(normalized_seg_annot):
                         if seg_annot == 1:
                             normalized_seg_annot[idx] = '<seg1000>'
@@ -93,7 +94,7 @@ class PreprocessorForLocalizationAndSegmentation:
                 normalized_seg_annots = normalized_seg_annots + chosen_annot
             else:
                 seg_annots = seg_annots[0]
-                normalized_seg_annots = [round(polypoint/image_width, 3) if polypoint % 2 != 0 else round(polypoint/image_height, 3) for polypoint in seg_annots]
+                normalized_seg_annots = [round(seg_annots[i]/image_height, 3) if i % 2 != 0 else round(seg_annots[i]/image_width, 3) for i in range(len(seg_annots))]
                 for idx, seg_annot in enumerate(normalized_seg_annots):
                     if seg_annot == 1:
                         normalized_seg_annots[idx] = '<seg1000>'

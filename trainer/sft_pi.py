@@ -485,7 +485,7 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     optimizer_config = OptimizerConfig(
-        lr=2e-5,
+        lr=3e-4,
         weight_decay=0.1,
         betas=(0.9, 0.95),
         eps=1e-8,
@@ -503,7 +503,7 @@ if __name__ == "__main__":
     wandb_config = WandbConfig(
         project='new-openvizr',
         entity='egmaminta',
-        name=f'{sys.argv[1]}-{sys.argv[2]}',
+        name=f'{sys.argv[1]}-{sys.argv[2]}-new',
     )
     trainer = SFTPiTrainer(
         policy_model=model,
@@ -538,7 +538,7 @@ if __name__ == "__main__":
     train_dataloader = trainer.build_dataloader(train_dataset)
     valid_dataloader = trainer.build_dataloader(valid_dataset)
 
-    num_epochs = 2
+    num_epochs = 3
     num_iterations = len(train_dataloader) * num_epochs
 
     trainer.set_lr_scheduler(
@@ -552,4 +552,4 @@ if __name__ == "__main__":
         num_iterations=num_iterations
     )
 
-    trainer.save_checkpoint(step=9999, save_dir=f'checkpoints/{sys.argv[1]}-{sys.argv[2]}')
+    trainer.save_checkpoint(step=9999, save_dir=f'checkpoints/{sys.argv[1]}-{sys.argv[2]}-new')
