@@ -57,9 +57,12 @@ class Trainer(ABC):
         """Add special tokens for location and segmentation tasks."""
         float_numbers = np.arange(0., 1., precision)
         tokens_for_loc_and_seg_tasks_original = [f"{num:.{len(str(precision).split('.')[-1])}f}" for num in float_numbers]
-        tokens_for_loc_and_seg_tasks = ['<seg' + num.split('.')[-1] + '>' for num in tokens_for_loc_and_seg_tasks_original]
-        tokens_for_loc_and_seg_tasks += ['<seg1000>', '<task:segmentation>', '<seg_r>', '</seg_r>']
-        tokens_for_loc_and_seg_tasks += ['<loc' + num.split('.')[-1] + '>' for num in tokens_for_loc_and_seg_tasks_original]
+
+        ## uncomment if you want to add segmentation tokens
+        # tokens_for_loc_and_seg_tasks = ['<seg' + num.split('.')[-1] + '>' for num in tokens_for_loc_and_seg_tasks_original]
+        # tokens_for_loc_and_seg_tasks += ['<seg1000>', '<task:segmentation>', '<seg_r>', '</seg_r>']
+
+        tokens_for_loc_and_seg_tasks = ['<loc' + num.split('.')[-1] + '>' for num in tokens_for_loc_and_seg_tasks_original]
         tokens_for_loc_and_seg_tasks += ['<loc1000>', '<task:localization>', '<loc_r>', '</loc_r>']
 
         self.logger.info(f'Special tokens for location and segmentation tasks added: {tokens_for_loc_and_seg_tasks}')
@@ -68,7 +71,7 @@ class Trainer(ABC):
 
         self.processor.tokenizer.add_tokens(tokens_for_loc_and_seg_tasks, special_tokens=False)
         self.tokenizer.add_tokens(tokens_for_loc_and_seg_tasks, special_tokens=False)
-        self.policy_model.resize_token_embeddings(len(self.processor.tokenizer), mean_resizing=False)
+        self.policy_model.resize_token_embeddings(len(self.processor.tokenizer), mean_resizing=True)
 
         assert len(self.processor.tokenizer) == len(self.tokenizer), "Base tokenizer and Processor tokenizer should have the same size."
         self.logger.info(f'New sizes:\n\tTokenizer size: {len(self.processor.tokenizer):,}\n\tEmbedding size: {self.policy_model.get_input_embeddings().weight.shape[0]:,}\n\tLM head size: {self.policy_model.lm_head.weight.shape[0]:,}')

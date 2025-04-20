@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Tuple, Literal
 
 
@@ -14,7 +14,7 @@ class OptimizerConfig:
     optim_type: str = 'adamw'
     lr: float = 3e-4
     adamw_weight_decay: float = 0.1
-    adamw_betas: Tuple[float] = (0.9, 0.95)
+    adamw_betas: Tuple[float] = field(default_factory=lambda: (0.9, 0.999))
     adamw_eps: float = 1e-8
     adamw_fused: bool = True
     warmup_iters: int = 512
@@ -31,5 +31,5 @@ class TrainingConfig:
     num_epochs: int = 2
     max_seq_length: int = 4000
     padding_side: Literal['left', 'right'] = 'right'
-    optim_config: OptimizerConfig = OptimizerConfig()
-    wandb_config: WandBConfig = WandBConfig()
+    optim_config: OptimizerConfig = field(default_factory=OptimizerConfig)
+    wandb_config: WandBConfig = field(default_factory=WandBConfig)

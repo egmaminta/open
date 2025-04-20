@@ -72,8 +72,9 @@ class SFTPiTrainer(Trainer):
             _sys_user_messages_attention_mask = _sys_user_messages_inputs['attention_mask'][0]
 
             _asst_message = b.pop('asst_message')
+            
             _asst_message_formal = self.processor.apply_chat_template(
-                _asst_message, add_generation_prompt=False, tokenize=False
+                [_asst_message], add_generation_prompt=False, tokenize=False
             )
             _asst_message_inputs = self.processor(
                 text=_asst_message_formal,
@@ -88,18 +89,23 @@ class SFTPiTrainer(Trainer):
             _attn_mask = torch.cat((_sys_user_messages_attention_mask, _asst_message_attention_mask), dim=0)
 
             if self.config.padding_side == 'right':
-                pad_tokens = torch.tensor([self.processor.tokenizer.pad_token_id] * ((self.config.max_seq_length + 1) - _input_ids.shape[0]), dim=0)
+                pad_tokens = torch.tensor([self.processor.tokenizer.pad_token_id] * ((self.config.max_seq_length + 1) - _input_ids.shape[0]), dtype=torch.long)
                 _input_ids_padded = torch.cat((_input_ids, pad_tokens), dim=0)
                 _attn_mask_padded = torch.cat((_attn_mask, torch.zeros_like(pad_tokens)), dim=0)
                 _ignore_sys_user_ids_mask_padded = torch.cat((_ignore_sys_user_ids_mask, torch.zeros_like(pad_tokens)), dim=0)
+                
+                if _ignore_sys_user_ids_mask_padded.sum() == 0:
+                    raise ValueError("No 1s in _ignore_sys_user_ids_mask_padded. This should not happen.")
+                
                 _labels = _input_ids_padded.clone()
                 _labels[_ignore_sys_user_ids_mask_padded == 0] = -100
 
                 if self.add_policy_loss:    ## NOQA: add a rewarding mask
-                    _advantage_points = _ignore_sys_user_ids_mask_padded * torch.cumsum(_ignore_sys_user_ids_mask_padded, dim=0)
-                    _advantage_points = (_advantage_points / _advantage_points.max()) * 5
+                    # _advantage_points = _ignore_sys_user_ids_mask_padded * torch.cumsum(_ignore_sys_user_ids_mask_padded, dim=0)
+                    # _advantage_points = (_advantage_points / _advantage_points.max()) * 5
+                    _advantage_points = _ignore_sys_user_ids_mask_padded * 0.9  ## NOQA: 0.1 is a placeholder value
                     _advantage_points = _advantage_points[1:].contiguous()[:self.config.max_seq_length]
-                
+
                 _input_ids_padded = _input_ids_padded[:-1].contiguous()[:self.config.max_seq_length]
                 _attn_mask_padded = _attn_mask_padded[:-1].contiguous()[:self.config.max_seq_length]
                 _labels = _labels[1:].contiguous()[:self.config.max_seq_length]
@@ -160,15 +166,22 @@ class SFTPiTrainer(Trainer):
 
         if self.add_policy_loss:    advantage_points = batch.pop('advantage_points').to(self.config.device)
 
+        ## ensure logits and labels are valid
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            raise ValueError("Logits contain NaN or Inf values.")
+        ## check if all labels are -100
+        if (labels == -100).all():
+            raise ValueError("All labels are -100. This should not happen.")
+
         ce_loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             labels.view(-1),
             ignore_index=-100
         )
 
+        log_probs, labels_mask = compute_log_probs(logits, labels)
         if self.add_policy_loss:
-            log_probs, labels_mask = compute_log_probs(logits, labels)
-            policy_loss = -(log_probs * advantage_points)
+            policy_loss = -(log_probs * advantage_points.type_as(logits))
             policy_loss = policy_loss.sum() / labels_mask.sum()
             loss = (ce_loss + policy_loss) / self.config.gradient_accumulation_steps
         else:   loss = ce_loss / self.config.gradient_accumulation_steps
@@ -180,14 +193,14 @@ class SFTPiTrainer(Trainer):
 
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
-            self.lr_scheduler.step()
+            self.scheduler.step()
 
         if step % self.config.wandb_config.log_every_n_steps == 0 and self.config.enable_wandb_logging:
             if self.special_viz_tokens_added_flag:
-                special_tokens = self.processor.tokenizer.convert_tokens_to_ids(['<seg_r>', '</seg_r>'])
+                special_tokens = self.processor.tokenizer.convert_tokens_to_ids(['<loc_r>', '</loc_r>'])
                 special_log_probs_by_id = {
                     special_token: log_probs[labels==token_id].mean().item()
-                    for special_token, token_id in zip(['<seg_r>', '</seg_r>'], special_tokens)
+                    for special_token, token_id in zip(['<loc_r>', '</loc_r>'], special_tokens)
                 }
 
                 wandb.log({k: v for k, v in special_log_probs_by_id.items()}, commit=False)
@@ -310,25 +323,26 @@ if __name__ == '__main__':
         adamw_betas=(0.9, 0.95),
         adamw_eps=1e-8,
         adamw_fused=True,
-        warmup_iters=512,
+        warmup_iters=256,
         cosine_scheduler_cycles=0.5
     )
     wandb_config = WandBConfig(
         wandb_project='SFTPi',
-        wandb_entity=sys.argv[4],
+        wandb_entity=sys.argv[5],
         wandb_name=f'SFTPi_{sys.argv[1]}_{sys.argv[2]}_{sys.argv[3]}',
+        log_every_n_steps=25
     )
     config = TrainingConfig(
-        batch_size=2,
-        gradient_accumulation_steps=32,
+        batch_size=8,
+        gradient_accumulation_steps=8,
         grad_clip=1.0,
         enable_wandb_logging=True,
         out_dir='output',
         device='cuda' if torch.cuda.is_available() else 'cpu',
         num_epochs=3,
-        max_seq_length=4000,
+        max_seq_length=1024,
         padding_side='right',
-        optimizer_config=optimizer_config,
+        optim_config=optimizer_config,
         wandb_config=wandb_config,
     )
 
@@ -345,12 +359,12 @@ if __name__ == '__main__':
     train_dset = pi_trainer.prepare_dataset(
         dataset='REFCOCOG',
         split='train',
-        preprocess_fn='refcocog_sft_seg'
+        preprocess_fn=sys.argv[4]
     )
     valid_dset = pi_trainer.prepare_dataset(
         dataset='REFCOCOG',
         split='validation',
-        preprocess_fn='refcocog_sft_seg'
+        preprocess_fn=sys.argv[4]
     )
     train_dloader = pi_trainer.build_dataloader(train_dset)
     valid_dloader = pi_trainer.build_dataloader(valid_dset)
@@ -361,4 +375,10 @@ if __name__ == '__main__':
 
     pi_trainer.train(train_dataloader=train_dloader, valid_dataloader=valid_dloader)
 
-    pi_trainer.save_checkpoint(ckp_name=f'{sys.argv[1]}_{sys.argv[2]}_{sys.argv[3]}')
+    pi_trainer.save_checkpoint(ckpt_name=f'{sys.argv[1]}_{sys.argv[2]}_{sys.argv[3]}')
+
+## sys.argv[1]: with_policy or without_policy
+## sys.argv[2]: connector, text, connector_text, or embeds
+## sys.argv[3]: add_special_loc_seg_tokens or no_special_loc_seg_tokens
+## sys.argv[4]: refcocog_sft_seg or refcocog_sft_loc
+## sys.argv[5]: wandb entity name
