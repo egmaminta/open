@@ -2,18 +2,17 @@ from transformers import AutoModelForVision2Seq, AutoTokenizer, AutoProcessor
 import torch
 import torch.nn.functional as F
 import wandb
-from typing import Dict, Literal
+from typing import Dict, Literal, Iterator
 from tqdm import tqdm
 import datasets
-from datasets import Dataset
 import sys
+import os
 from transformers.image_utils import load_image
-
 
 from .trainer import Trainer
 from .config import TrainingConfig, OptimizerConfig, WandBConfig
 from .data_preprocessor import PreprocessorForLocalizationAndSegmentation
-from .utils import compute_log_probs
+from .utils import compute_log_probs, get_batch
 
 
 class SFTPiTrainer(Trainer):
@@ -37,7 +36,7 @@ class SFTPiTrainer(Trainer):
         dataset: Literal['REFCOCO', 'REFCOCOG', 'REFCOCOPLUS'],
         split: str = 'train',
         preprocess_fn: str = 'refcocog_sft_seg'
-    ) -> Dataset:
+    ) -> datasets.Dataset:
         return PreprocessorForLocalizationAndSegmentation.preprocess(
             dataset=dataset,
             split=split,
@@ -147,7 +146,7 @@ class SFTPiTrainer(Trainer):
                 'pixel_attention_mask': pixel_attention_mask
             }
 
-    def build_dataloader(self, dataset: Dataset) -> torch.utils.data.DataLoader:
+    def build_dataloader(self, dataset: datasets.Dataset) -> torch.utils.data.DataLoader:
         return torch.utils.data.DataLoader(
             dataset,
             batch_size=self.config.batch_size,
@@ -157,135 +156,166 @@ class SFTPiTrainer(Trainer):
             pin_memory=True,
         )
 
-
-    def train_step(self, batch: Dict[str, torch.Tensor], step: int) -> float:
-        self.policy_model.train()
-
-        inputs = {k: v.to(self.config.device) for k, v in batch.items() if k not in ['labels', 'advantage_points']}
-        labels = batch.pop('labels').to(self.config.device)
-        logits = self.policy_model(**inputs, use_cache=False).logits
-
-        if self.add_policy_loss:    advantage_points = batch.pop('advantage_points').to(self.config.device)
-
-        ## ensure logits and labels are valid
-        if torch.isnan(logits).any() or torch.isinf(logits).any():
-            raise ValueError("Logits contain NaN or Inf values.")
-        ## check if all labels are -100
-        if (labels == -100).all():
-            raise ValueError("All labels are -100. This should not happen.")
-
-        ce_loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1),
-            ignore_index=-100
-        )
-
-        log_probs, labels_mask = compute_log_probs(logits, labels)
-        if self.add_policy_loss:
-            policy_loss = -(log_probs * advantage_points.type_as(logits))
-            policy_loss = policy_loss.sum() / labels_mask.sum()
-            loss = (ce_loss + policy_loss) / self.config.gradient_accumulation_steps
-        else:   loss = ce_loss / self.config.gradient_accumulation_steps
-
-        loss.backward()
-
-        if (step + 1) % self.config.gradient_accumulation_steps == 0:
-            if self.config.grad_clip > 0:   torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), self.config.grad_clip)
-
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
-            self.scheduler.step()
-
-        if step % self.config.wandb_config.log_every_n_steps == 0 and self.config.enable_wandb_logging:
-            if self.special_viz_tokens_added_flag:
-                special_tokens = self.processor.tokenizer.convert_tokens_to_ids(['<loc_r>', '</loc_r>', '<seg_r>', '</seg_r>'])
-                special_log_probs_by_id = {
-                    special_token: log_probs[labels==token_id].mean().item()
-                    for special_token, token_id in zip(['<loc_r>', '</loc_r>', '<seg_r>', '</seg_r>'], special_tokens)
-                }
-
-                wandb.log({k: v for k, v in special_log_probs_by_id.items()}, commit=False)
-            wandb.log({'loss': loss.item()}, commit=True)
-
-        return loss.item()
-
-    def evaluate(self, valid_dataloader: torch.utils.data.DataLoader) -> float:
+    def evaluate(
+        self,
+        val_dataloader: torch.utils.data.DataLoader,
+        curr_val_iter: Iterator[Dict[str, torch.Tensor]],
+        eval_iters: int
+    ) -> Iterator[Dict[str, torch.Tensor]]:
+        
         self.policy_model.eval()
 
-        valid_samples = iter(valid_dataloader)
-        iter_count = 0
         valid_loss = 0.0
-        while iter_count < 10:      ## NOQA: 10 for testing purposes
-            try:    batch = next(valid_samples)
-            except StopIteration:
-                valid_samples = iter(valid_dataloader)
-                batch = next(valid_samples)
+        
+        with torch.no_grad():
+            for _ in range(eval_iters):
+                batch, curr_val_iter  = get_batch(val_dataloader, curr_val_iter)
 
-            iter_count += 1
-            with torch.no_grad():
+                inputs = {k: v.to(self.config.device) for k, v in batch.items() if k not in ['labels', 'advantage_points']}
+                labels = batch.pop('labels').to(self.config.device)
+                logits = self.policy_model(**inputs, use_cache=False).logits
+
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                    ignore_index=-100,
+                )
+                valid_loss += loss.item()
+
+        valid_loss /= eval_iters
+
+        if self.config.enable_wandb_logging:
+            wandb.log({
+                'valid_loss': valid_loss,
+            }, commit=True)
+
+        self.policy_model.train()
+
+        return curr_val_iter
+
+
+    def train(self, train_dataset: datasets.Dataset, eval_dataset: datasets.Dataset) -> None:
+        self.policy_model.train()
+
+        n_trainable_params = sum(p.numel() for p in self.policy_model.parameters() if p.requires_grad)
+        self.logger.info(f"Number of trainable parameters: {n_trainable_params / 1e6:.2f}M")
+        trainable_vision = sum(p.numel() for p in self.policy_model.model.vision_model.parameters() if p.requires_grad)
+        trainable_text = sum(p.numel() for p in self.policy_model.model.text_model.parameters() if p.requires_grad)
+        trainable_connector = sum(p.numel() for p in self.policy_model.model.connector.parameters() if p.requires_grad)
+        trainable_lm_head = sum(p.numel() for p in self.policy_model.lm_head.parameters() if p.requires_grad)
+        assert trainable_vision + trainable_text + trainable_connector + trainable_lm_head == n_trainable_params, \
+            f"Trainable parameters mismatch: {trainable_vision + trainable_text + trainable_connector + trainable_lm_head} != {n_trainable_params}"
+        self.logger.info(f"Breakdown of trainable parameters:\n\t\t\tVision Encoder: {trainable_vision / 1e6:.2f}M\n\t\t\tText Encoder: {trainable_text / 1e6:.2f}M\n\t\t\tConnector: {trainable_connector / 1e6:.2f}M\n\t\t\tLM Head: {trainable_lm_head / 1e6:.2f}M")
+
+        train_dataloader = self.build_dataloader(train_dataset)
+        val_dataloader = self.build_dataloader(eval_dataset)
+
+        self.config.num_iterations = len(train_dataloader) * self.config.num_epochs // self.config.gradient_accumulation_steps
+        self.logger.info(f"No. of training iterations: {self.config.num_iterations:,}")
+
+        self.configure_and_set_optimizer_and_scheduler()
+
+        progress_bar = tqdm(range(self.config.num_iterations), desc="Training", file=sys.stdout)
+        iter_num = 0
+
+        curr_train_iter = iter(train_dataloader)
+        curr_val_iter = iter(val_dataloader)
+
+        while iter_num < self.config.num_iterations:
+            for _ in range(self.config.gradient_accumulation_steps):
+                batch, curr_train_iter = get_batch(train_dataloader, curr_train_iter)
+
                 inputs = {k: v.to(self.config.device) for k, v in batch.items() if k not in ['labels', 'advantage_points']}
                 labels = batch.pop('labels').to(self.config.device)
 
                 logits = self.policy_model(**inputs, use_cache=False).logits
 
+                if self.add_policy_loss:
+                    advantage_points = batch.pop('advantage_points').to(self.config.device)
+
+                ## ensure logits and labels are valid
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    self.logger.warning("Logits contain NaN or Inf values.")
+                    raise ValueError("Logits contain NaN or Inf values.")
+                ## check if all labels are -100
+                if (labels == -100).all():
+                    self.logger.warning("All labels are -100.")
+                    raise ValueError("All labels are -100. This should not happen.")
+
                 ce_loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     labels.view(-1),
-                    ignore_index=-100
+                    ignore_index=-100,
                 )
 
-                valid_loss += ce_loss.item()
-        valid_loss /= iter_count
-        wandb.log({'valid_loss': valid_loss}, commit=True)
+                if self.add_policy_loss:
+                    log_probs, labels_mask = compute_log_probs(logits, labels)
+                    policy_loss = -(log_probs * advantage_points.type_as(logits))
+                    policy_loss = policy_loss.sum() / labels_mask.sum()
+                    loss = (ce_loss + policy_loss) / self.config.gradient_accumulation_steps
+                else:
+                    loss = ce_loss / self.config.gradient_accumulation_steps
 
-        self.policy_model.train()
-        return valid_loss
+                loss.backward()
 
-    def train(self, train_dataloader: torch.utils.data.DataLoader, valid_dataloader: torch.utils.data.DataLoader):
-        n_trainable_params = sum(p.numel() for p in self.policy_model.parameters() if p.requires_grad)
-        self.logger.info(f'No. of trainable parameters: {n_trainable_params:,}')
-        trainable_vision = sum(p.numel() for p in self.policy_model.model.vision_model.parameters() if p.requires_grad)
-        trainable_text = sum(p.numel() for p in self.policy_model.model.text_model.parameters() if p.requires_grad)
-        trainable_connector = sum(p.numel() for p in self.policy_model.model.connector.parameters() if p.requires_grad)
-        trainable_lm_head = sum(p.numel() for p in self.policy_model.lm_head.parameters() if p.requires_grad)
-        assert trainable_vision + trainable_text + trainable_connector + trainable_lm_head == n_trainable_params, f"Trainable parameters mismatch: {trainable_vision:,} + {trainable_text:,} + {trainable_connector:,} + {trainable_lm_head:,} != {n_trainable_params:,}"
-        self.logger.info(f'Breakdown of trainable parameters:\n\tVision Encoder: {trainable_vision:,}\n\tLanguage Model: {trainable_text:,}\n\tConnector: {trainable_connector:,}\n\tLM Head: {trainable_lm_head:,}')
-        self.logger.info(f'No. of training iterations: {self.config.num_iterations:,}')
+            ## write true labels vs predicted labels to model_predictions.txt
+            write_predictions_path = os.path.join(self.config.out_dir, 'model_predictions.txt')
+            if not os.path.exists(write_predictions_path):
+                with open(write_predictions_path, 'w') as f:
+                    f.write('')
+            with open(write_predictions_path, 'a') as f:
+                f.write(f"Iteration: {iter_num + 1}\n")
+                f.write(f"Ground truth: {self.processor.tokenizer.decode(inputs['input_ids'][0], skip_special_tokens=True)}\n")
+                with torch.no_grad():
+                    pred = torch.argmax(logits, dim=-1)
+                    pred_sample = self.processor.tokenizer.decode(pred[0], skip_special_tokens=True)
+                    f.write(f"Prediction: {pred_sample}\n")
+                f.write('=' * 100 + '\n')
+                f.flush()
+                os.fsync(f.fileno())
 
-        progress_bar = tqdm(range(self.config.num_iterations), file=sys.stdout, bar_format='{l_bar}{bar:30}{r_bar}{bar:-30b}')
-        step = 1
-        train_samples = iter(train_dataloader)
-        while step <= self.config.num_iterations:
-            try:    train_batch = next(train_samples)
-            except StopIteration:
-                train_samples = iter(train_dataloader)
-                train_batch = next(train_samples)
+            if self.config.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), self.config.grad_clip)
 
-            train_loss = self.train_step(train_batch, step)
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            self.scheduler.step()
 
-            if step % self.config.wandb_config.log_every_n_steps == 0 and self.config.enable_wandb_logging:
-                valid_loss = self.evaluate(valid_dataloader)
-                wandb.log({'valid_loss': valid_loss}, commit=True)
-                progress_bar.set_postfix({'train_loss': train_loss, 'valid_loss': valid_loss})
+            if (iter_num + 1) % self.config.wandb_config.log_every_n_steps == 0 and self.config.enable_wandb_logging:
+                wandb.log({
+                    'train_loss': loss.item(),
+                    'learning_rate': self.optimizer.param_groups[0]['lr'],
+                    'iteration': iter_num + 1,
+                }, commit=False)
 
+                curr_val_iter = self.evaluate(
+                    val_dataloader=val_dataloader,
+                    curr_val_iter=curr_val_iter,
+                    eval_iters=self.config.eval_iters
+                )
+
+            iter_num += 1
             progress_bar.update(1)
-            step += 1
-        progress_bar.close()
-        self.logger.info(f'Finished training')
+            progress_bar.set_postfix(
+                loss=loss.item(),
+                learning_rate=self.optimizer.param_groups[0]['lr'],
+                iteration=iter_num,
+            )
 
         if self.config.enable_wandb_logging:
             wandb.finish()
-            self.logger.info(f'WandB logging finished')
 
+        progress_bar.close()
+        self.logger.info("Training complete.")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     match sys.argv[1]:
         case 'with_policy':
             add_policy_loss = True
         case 'without_policy':
             add_policy_loss = False
         case _:
-            raise ValueError(f'Invalid argument: {sys.argv[1]}')
+            raise ValueError(f"Invalid argument: {sys.argv[1]}. Must be one of ['with_policy', 'without_policy'].")
 
     match sys.argv[2]:
         case 'connector':
@@ -299,7 +329,7 @@ if __name__ == '__main__':
         case 'all':
             finetune_mode = 'all'
         case _:
-            raise ValueError(f"Invalid argument: {sys.argv[2]}. Use 'connector', 'text', 'connector_text', or 'embeds'.")
+            raise ValueError(f"Invalid argument: {sys.argv[2]}. Must be one of ['connector', 'text', 'connector_text', 'embeds', 'all'].")
 
     match sys.argv[3]:
         case 'add_special_loc_seg_tokens':
@@ -307,14 +337,14 @@ if __name__ == '__main__':
         case 'no_special_loc_seg_tokens':
             do_add_tokens_for_loc_and_seg_tasks = False
         case _:
-            raise ValueError(f"Invalid argument: {sys.argv[3]}. Use 'add_special_loc_seg_tokens' or 'no_special_loc_seg_tokens'.")
+            raise ValueError(f"Invalid argument: {sys.argv[3]}. Must be one of ['add_special_loc_seg_tokens', 'no_special_loc_seg_tokens'].")
 
     model_name = 'HuggingFaceTB/SmolVLM-Instruct'
     model = AutoModelForVision2Seq.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
         attn_implementation='flash_attention_2',
-        device_map='auto'
+        device_map='auto',
     )
     processor = AutoProcessor.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -326,30 +356,33 @@ if __name__ == '__main__':
         adamw_betas=(0.9, 0.95),
         adamw_eps=1e-8,
         adamw_fused=True,
-        warmup_iters=5120,
+        warmup_iters=1024,
         cosine_scheduler_cycles=0.5
     )
+
     wandb_config = WandBConfig(
         wandb_project='SFTPi-Combined-Loc-Seg',
         wandb_entity=sys.argv[4],
         wandb_name=f'SFTPi_{sys.argv[1]}_{sys.argv[2]}_{sys.argv[3]}',
-        log_every_n_steps=25
+        log_every_n_steps=100
     )
+
     config = TrainingConfig(
         batch_size=2,
         gradient_accumulation_steps=32,
         grad_clip=1.0,
         enable_wandb_logging=True,
         out_dir='output',
-        device='cuda' if torch.cuda.is_available() else 'cpu',
+        device='cuda',
         num_epochs=3,
         max_seq_length=4000,
         padding_side='right',
         optim_config=optimizer_config,
         wandb_config=wandb_config,
+        eval_iters=10
     )
 
-    pi_trainer = SFTPiTrainer(
+    trainer = SFTPiTrainer(
         policy_model=model,
         processor=processor,
         tokenizer=tokenizer,
@@ -359,57 +392,36 @@ if __name__ == '__main__':
         add_policy_loss=add_policy_loss
     )
 
-    # train_dset = pi_trainer.prepare_dataset(
-    #     dataset='REFCOCOG',
-    #     split='train',
-    #     preprocess_fn=sys.argv[4]
-    # )
-    
-    train_dset_seg = pi_trainer.prepare_dataset(
+    train_dataset_seg = trainer.prepare_dataset(
         dataset='REFCOCOG',
         split='train',
         preprocess_fn='refcocog_sft_seg'
     )
-    train_dset_loc = pi_trainer.prepare_dataset(
-        dataset='REFCOCOG',
+    train_dataset_loc = trainer.prepare_dataset(
+        dataset='REFCOCO',
         split='train',
         preprocess_fn='refcocog_sft_loc'
     )
-    train_dset = datasets.concatenate_datasets([train_dset_seg, train_dset_loc])
-    train_dset = train_dset.shuffle(seed=42)
-    
-    # valid_dset = pi_trainer.prepare_dataset(
-    #     dataset='REFCOCOG',
-    #     split='validation',
-    #     preprocess_fn=sys.argv[4]
-    # )
-    valid_dset_seg = pi_trainer.prepare_dataset(
+    train_dataset = datasets.concatenate_datasets([train_dataset_seg, train_dataset_loc])
+    train_dataset = train_dataset.shuffle(seed=42)
+
+    eval_dataset_seg = trainer.prepare_dataset(
         dataset='REFCOCOG',
         split='validation',
         preprocess_fn='refcocog_sft_seg'
     )
-    valid_dset_loc = pi_trainer.prepare_dataset(
-        dataset='REFCOCOG',
+    eval_dataset_loc = trainer.prepare_dataset(
+        dataset='REFCOCO',
         split='validation',
         preprocess_fn='refcocog_sft_loc'
     )
-    valid_dset = datasets.concatenate_datasets([valid_dset_seg, valid_dset_loc])
-    valid_dset = valid_dset.shuffle(seed=42)
-    
-    
-    train_dloader = pi_trainer.build_dataloader(train_dset)
-    valid_dloader = pi_trainer.build_dataloader(valid_dset)
 
-    pi_trainer.config.num_iterations = len(train_dloader) * pi_trainer.config.num_epochs
+    eval_dataset = datasets.concatenate_datasets([eval_dataset_seg, eval_dataset_loc])
+    eval_dataset = eval_dataset.shuffle(seed=42)
 
-    pi_trainer.configure_and_set_optimizer_and_scheduler()
+    trainer.train(
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset
+    )
 
-    pi_trainer.train(train_dataloader=train_dloader, valid_dataloader=valid_dloader)
-
-    pi_trainer.save_checkpoint(ckpt_name=f'{sys.argv[1]}_{sys.argv[2]}_{sys.argv[3]}_combined_loc_seg')
-
-## sys.argv[1]: with_policy or without_policy
-## sys.argv[2]: connector, text, connector_text, or embeds
-## sys.argv[3]: add_special_loc_seg_tokens or no_special_loc_seg_tokens
-## sys.argv[4]: refcocog_sft_seg or refcocog_sft_loc
-## sys.argv[5]: wandb entity name
+    trainer.save_checkpoint(ckpt_name=f'SFTPi_{sys.argv[1]}_{sys.argv[2]}_{sys.argv[3]}_combined_loc_seg')

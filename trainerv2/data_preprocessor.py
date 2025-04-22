@@ -12,23 +12,13 @@ _LOCALIZATION_AND_SEGMENTATION_DATASETS_ = {
     'REFCOCOPLUS': 'jxu124/refcocoplus',
 }
 
-def normalize_segmentation(segmentation, width, height):
+def normalize_point(annotation, width, height):
     normalized = [
         round(coord / height, 3) if i % 2 != 0 else round(coord / width, 3)
-        for i, coord in enumerate(segmentation)
+        for i, coord in enumerate(annotation)
     ]
     return [
-        f"<seg1000>" if coord == 1 else f"<seg{str(coord).split('.')[-1]:0>3}>"
-        for coord in normalized
-    ]
-
-def normalize_bbox(bbox, width, height):
-    normalized = [
-        round(coord / height, 3) if i % 2 != 0 else round(coord / width, 3)
-        for i, coord in enumerate(bbox)
-    ]
-    return [
-        f"<loc1000>" if coord == 1 else f"<loc{str(coord).split('.')[-1]:0>3}>"
+        f"<polypt_1000>" if coord == 1 else f"<polypt_{str(coord).split('.')[-1]:0>3}>"
         for coord in normalized
     ]
 
@@ -88,23 +78,23 @@ def process_sample(sample: Dict[str, Any], task: str) -> Dict[str, Any]:
         if len(annots) > 1:
             normalized_annots = ""
             for annot in annots:
-                normalized = normalize_segmentation(annot, image_width, image_height)
+                normalized = normalize_point(annot, image_width, image_height)
                 normalized_annots += format_normalized_segmentation(normalized)
             normalized_annots += chosen_annot
         else:
             annot = annots[0]
-            normalized = normalize_segmentation(annot, image_width, image_height)
+            normalized = normalize_point(annot, image_width, image_height)
             normalized_annots = format_normalized_segmentation(normalized) + chosen_annot
     elif task == 'loc':
         if len(annots) > 1:
             normalized_annots = ""
             for annot in annots:
-                normalized = normalize_bbox(annot, image_width, image_height)
+                normalized = normalize_point(annot, image_width, image_height)
                 normalized_annots += format_normalized_bbox(normalized)
             normalized_annots += chosen_annot
         else:
             annot = annots[0]
-            normalized = normalize_bbox(annot, image_width, image_height)
+            normalized = normalize_point(annot, image_width, image_height)
             normalized_annots = format_normalized_bbox(normalized) + chosen_annot
     else:   raise ValueError(f"Unsupported task: {task}")
     
@@ -213,3 +203,25 @@ class PreprocessorForLocalizationAndSegmentation(object):
         chosen_cols = ['sys_user_message', 'asst_message', 'image_path', 'task_target']
         dataset = dataset.remove_columns([col for col in dataset.column_names if col not in chosen_cols])
         return dataset
+
+
+# if __name__ == "__main__":
+#     dataset_seg = PreprocessorForLocalizationAndSegmentation.preprocess(
+#         dataset='REFCOCOG',
+#         split='train',
+#         preprocess_fn='refcocog_sft_seg'
+#     )
+#     dataset_loc = PreprocessorForLocalizationAndSegmentation.preprocess(
+#         dataset='REFCOCOG',
+#         split='train',
+#         preprocess_fn='refcocog_sft_loc'
+#     )
+#     dataset = datasets.concatenate_datasets([dataset_seg, dataset_loc])
+#     dataset = dataset.shuffle(seed=42)
+#     dataset = dataset.select(range(100))  ## NOQA: 100 for testing purposes
+    
+#     print(dataset[0])
+#     print(dataset[1])
+#     print(dataset[2])
+#     print(dataset[3])
+#     print(dataset[4])

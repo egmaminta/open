@@ -33,3 +33,4 @@ class TrainingConfig:
     padding_side: Literal['left', 'right'] = 'right'
     optim_config: OptimizerConfig = field(default_factory=OptimizerConfig)
     wandb_config: WandBConfig = field(default_factory=WandBConfig)
+    eval_iters: int = 100

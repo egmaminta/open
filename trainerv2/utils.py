@@ -1,10 +1,18 @@
 import torch
 from transformers import AutoModelForVision2Seq
 import torch.nn.functional as F
-from typing import Tuple, Literal
+from typing import Tuple, Literal, Dict, Iterator
 from loguru import logger
 
 
+def get_batch(dataloader: torch.utils.data.DataLoader, curr_iter: Iterator[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    try:
+        batch = next(curr_iter)
+    except StopIteration:
+        ## reset the iterator
+        curr_iter = iter(dataloader)
+        batch = next(curr_iter)
+    return batch, curr_iter
 
 def compute_log_probs(logits: torch.Tensor, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     labels_mask = (labels != -100).float()
@@ -94,7 +102,16 @@ def configure_connector_text(model: torch.nn.Module | AutoModelForVision2Seq) ->
     logger.info('Connector, Language model, and LM head are set to train mode.')
     logger.info('Vision model is set to eval mode.')
 
-def configure_finetune_mode(finetune_mode: Literal['connector', 'text', 'connector_text', 'embeds'], model: torch.nn.Module | AutoModelForVision2Seq) -> None:
+def configure_all(model: torch.nn.Module | AutoModelForVision2Seq) -> None:
+    for param in model.parameters():
+        param.requires_grad = True
+
+    model.train()
+
+    logger.info('Vision model, Language model, Connector, and LM head are set to train mode.')
+    logger.info('All parameters are set to require gradients.')
+
+def configure_finetune_mode(finetune_mode: Literal['connector', 'text', 'connector_text', 'embeds', 'all'], model: torch.nn.Module | AutoModelForVision2Seq) -> None:
     match finetune_mode:
         case 'connector':
             configure_connector(model)
@@ -104,6 +121,8 @@ def configure_finetune_mode(finetune_mode: Literal['connector', 'text', 'connect
             configure_connector_text(model)
         case 'embeds':
             configure_embeds(model)
+        case 'all':
+            configure_all(model)
         case _:
             raise ValueError(f'Invalid finetune mode: {finetune_mode}. Expected one of ["connector", "text", "connector_text", "embeds"].')
 
